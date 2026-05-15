@@ -1,6 +1,11 @@
 package com.example.spark
 
 import android.Manifest
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -21,7 +26,9 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.Canvas
@@ -44,6 +51,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
@@ -70,6 +78,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -111,6 +120,55 @@ import com.example.spark.ui.theme.SparkClay
 import com.example.spark.ui.theme.SparkPeach
 import com.example.spark.ui.theme.SparkTheme
 import kotlinx.coroutines.delay
+
+// ─── Connectivity helpers ──────────────────────────────────────────────────────
+
+@Composable
+private fun rememberIsOnline(): Boolean {
+    val context = LocalContext.current
+    val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+
+    fun currentlyOnline(): Boolean {
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    var isOnline by remember { mutableStateOf(currentlyOnline()) }
+
+    DisposableEffect(Unit) {
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) { isOnline = true }
+            override fun onLost(network: Network) { isOnline = false }
+        }
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        cm.registerNetworkCallback(request, callback)
+        onDispose { cm.unregisterNetworkCallback(callback) }
+    }
+
+    return isOnline
+}
+
+@Composable
+private fun NoInternetBanner() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFFCC3333))
+            .statusBarsPadding()
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = "Нет подключения к интернету",
+            color = Color.White,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold
+        )
+    }
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -317,6 +375,7 @@ private fun SparkApp() {
     }
 
     val isSignedIn = token != null
+    val isOnline = rememberIsOnline()
 
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -435,6 +494,16 @@ private fun SparkApp() {
                     selectedChallengeId = null
                 }
             )
+        }
+
+        // Баннер отсутствия интернета (поверх всего контента)
+        AnimatedVisibility(
+            visible = !isOnline,
+            enter = fadeIn(tween(300)) + slideInVertically(tween(300)) { -it },
+            exit = fadeOut(tween(300)) + slideOutVertically(tween(300)) { -it },
+            modifier = Modifier.align(Alignment.TopCenter)
+        ) {
+            NoInternetBanner()
         }
     }
 }

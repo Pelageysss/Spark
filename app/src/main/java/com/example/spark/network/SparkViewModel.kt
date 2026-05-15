@@ -62,7 +62,17 @@ class SparkViewModel(
         viewModelScope.launch {
             _authState.value = AuthState.Loading
             repo.register(email, password)
-                .onSuccess { _authState.value = AuthState.Success }
+                .onSuccess {
+                    // После успешной регистрации сразу входим в аккаунт
+                    repo.login(email, password)
+                        .onSuccess { resp ->
+                            tokenStore.save(resp.accessToken)
+                            _token.value = resp.accessToken
+                            _authState.value = AuthState.Success
+                            loadAll(resp.accessToken)
+                        }
+                        .onFailure { _authState.value = AuthState.Error(it.message ?: "Ошибка входа после регистрации") }
+                }
                 .onFailure { _authState.value = AuthState.Error(it.message ?: "Ошибка регистрации") }
         }
     }
