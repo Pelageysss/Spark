@@ -46,11 +46,13 @@ jobs:
           cp app/build/outputs/apk/release/*.apk dist/Spark.apk
 
       - name: Delete existing latest release
+        if: github.event_name == 'push'
         run: gh release delete latest --yes || true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create GitHub Release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
