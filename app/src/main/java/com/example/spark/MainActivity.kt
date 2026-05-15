@@ -381,6 +381,7 @@ private fun SparkApp() {
         modifier = Modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background
     ) {
+        Box(modifier = Modifier.fillMaxSize()) {
         AnimatedVisibility(
             visible = showSplash,
             enter = fadeIn(tween(500)) + scaleIn(initialScale = 0.96f),
@@ -505,6 +506,7 @@ private fun SparkApp() {
         ) {
             NoInternetBanner()
         }
+        } // Box
     }
 }
 
