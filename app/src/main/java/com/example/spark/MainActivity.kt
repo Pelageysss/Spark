@@ -51,11 +51,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -69,6 +71,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -86,12 +89,22 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.spark.network.AuthState
+import com.example.spark.network.ChallengeStateResponse
+import com.example.spark.network.DataState
+import com.example.spark.network.ProfileResponse
+import com.example.spark.network.ProfileUpdateRequest
+import com.example.spark.network.SparkViewModel
 import com.example.spark.ui.theme.SparkCoral
 import com.example.spark.ui.theme.SparkGold
 import com.example.spark.ui.theme.SparkClay
@@ -216,15 +229,7 @@ private data class Achievement(
     val accent: Color
 )
 
-private data class SparkUser(
-    val name: String = "Аня",
-    val courage: Int = 34,
-    val completed: Int = 12,
-    val skipped: Int = 1,
-    val streak: Int = 4,
-    val notificationsEnabled: Boolean = false,
-    val level: String = "Искатель"
-)
+// SparkUser удалён — используется ProfileResponse из API
 
 private val initialChallenges = listOf(
     Challenge(
@@ -285,18 +290,33 @@ private val initialChallenges = listOf(
 
 @Composable
 private fun SparkApp() {
+    val context = LocalContext.current
+    val vm: SparkViewModel = viewModel(factory = SparkViewModel.Factory(context))
+
+    val token by vm.token.collectAsState()
+    val authState by vm.authState.collectAsState()
+    val profileState by vm.profile.collectAsState()
+    val challengesState by vm.challenges.collectAsState()
+
     var showSplash by rememberSaveable { mutableStateOf(true) }
     var onboardingDone by rememberSaveable { mutableStateOf(false) }
-    var isSignedIn by rememberSaveable { mutableStateOf(false) }
     var currentScreen by rememberSaveable { mutableStateOf(SparkScreen.Home) }
-    var user by remember { mutableStateOf(SparkUser()) }
-    var challenges by remember { mutableStateOf(initialChallenges) }
-    var selectedChallenge by remember { mutableStateOf<Challenge?>(null) }
+    var selectedChallengeId by rememberSaveable { mutableStateOf<Int?>(null) }
 
     LaunchedEffect(Unit) {
         delay(1100)
         showSplash = false
     }
+
+    // Сбрасываем экран при выходе из аккаунта
+    LaunchedEffect(token) {
+        if (token == null) {
+            currentScreen = SparkScreen.Home
+            selectedChallengeId = null
+        }
+    }
+
+    val isSignedIn = token != null
 
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -323,15 +343,7 @@ private fun SparkApp() {
             ) { appStage ->
                 when (appStage) {
                     SparkAppStage.Onboarding -> OnboardingScreen(onFinish = { onboardingDone = true })
-                    SparkAppStage.Auth -> AuthScreen(
-                        onSignIn = { name ->
-                            user = SparkUser(name = name.ifBlank { "Аня" })
-                            challenges = initialChallenges
-                            currentScreen = SparkScreen.Home
-                            selectedChallenge = null
-                            isSignedIn = true
-                        }
-                    )
+                    SparkAppStage.Auth -> AuthScreen(vm = vm)
                     SparkAppStage.Main -> {
                         Scaffold(
                             containerColor = MaterialTheme.colorScheme.background,
@@ -350,17 +362,13 @@ private fun SparkApp() {
                                 SparkMainContent(
                                     modifier = Modifier.padding(innerPadding),
                                     screen = screen,
-                                    user = user,
-                                    challenges = challenges,
-                                    onOpenChallenge = { selectedChallenge = it },
+                                    profileState = profileState,
+                                    challengesState = challengesState,
+                                    onOpenChallenge = { selectedChallengeId = it },
                                     onNotificationsChanged = { enabled ->
-                                        user = user.copy(notificationsEnabled = enabled)
+                                        vm.updateProfile(ProfileUpdateRequest(notificationsEnabled = enabled))
                                     },
-                                    onLogout = {
-                                        isSignedIn = false
-                                        selectedChallenge = null
-                                        currentScreen = SparkScreen.Home
-                                    }
+                                    onLogout = { vm.logout() }
                                 )
                             }
                         }
@@ -369,51 +377,62 @@ private fun SparkApp() {
             }
         }
 
-        selectedChallenge?.let { challenge ->
-            val currentChallenge = challenges.firstOrNull { it.id == challenge.id } ?: challenge
-            val activeChallenge = challenges.firstOrNull { it.status.isLockedInProgress() }
+        // Bottom sheet задания
+        selectedChallengeId?.let { openId ->
+            val apiStates = (challengesState as? DataState.Ready)?.data ?: emptyList()
+            val apiState = apiStates.firstOrNull { it.challengeId == openId }
+            val challenge = initialChallenges.firstOrNull { it.id == openId } ?: return@let
+            val status = apiState?.status ?: "open"
+            val activeId = apiStates.firstOrNull { it.status == "active" || it.status == "checking" }?.challengeId
+            val activeChallenge = activeId?.let { id -> initialChallenges.firstOrNull { it.id == id } }
+
             ChallengeSheet(
-                challenge = currentChallenge,
+                challenge = challenge,
+                status = status,
+                photoUrl = apiState?.photoUrl,
                 activeChallenge = activeChallenge,
-                onDismiss = { selectedChallenge = null },
+                onDismiss = { selectedChallengeId = null },
                 onStart = {
-                    val updated = currentChallenge.copy(status = CompletionStatus.Active)
-                    challenges = challenges.replaceChallenge(updated)
-                    selectedChallenge = updated
+                    vm.updateChallenge(openId, "active")
                 },
-                onOpenActive = {
-                    selectedChallenge = activeChallenge
-                },
-                onComplete = { photo ->
-                    val updated = currentChallenge.copy(
-                        status = if (currentChallenge.type == ChallengeType.Photo) CompletionStatus.Checking else CompletionStatus.Done,
-                        selectedPhoto = photo
-                    )
-                    challenges = challenges.replaceChallenge(updated)
-                    user = user.afterCompleted(currentChallenge.difficulty)
-                    if (currentChallenge.type == ChallengeType.Photo) {
-                        selectedChallenge = updated
-                    } else {
-                        selectedChallenge = null
-                    }
-                },
-                onPhotoVerified = { photo ->
-                    challenges = challenges.replaceChallenge(
-                        currentChallenge.copy(
-                            status = CompletionStatus.Done,
-                            selectedPhoto = photo
+                onOpenActive = { selectedChallengeId = activeId },
+                onComplete = { photoUri ->
+                    val newStatus = if (challenge.type == ChallengeType.Photo) "checking" else "done"
+                    vm.updateChallenge(openId, newStatus, photoUri?.toString())
+                    // Обновляем профиль: courage + streak
+                    val profile = (profileState as? DataState.Ready)?.data
+                    if (profile != null) {
+                        val bonus = if ((profile.streak + 1) % 7 == 0) 25 else 0
+                        val newCourage = (profile.courage + challenge.difficulty.couragePoints + bonus).coerceAtMost(100)
+                        val newStreak = profile.streak + 1
+                        vm.updateProfile(
+                            ProfileUpdateRequest(
+                                courage = newCourage,
+                                completed = profile.completed + 1,
+                                streak = newStreak,
+                                level = levelFor(newCourage)
+                            )
                         )
-                    )
-                    selectedChallenge = null
+                    }
+                    if (challenge.type != ChallengeType.Photo) selectedChallengeId = null
+                },
+                onPhotoVerified = { photoUri ->
+                    vm.updateChallenge(openId, "done", photoUri?.toString())
+                    selectedChallengeId = null
                 },
                 onSkip = {
-                    challenges = challenges.replaceChallenge(currentChallenge.copy(status = CompletionStatus.Skipped))
-                    user = user.copy(
-                        courage = (user.courage - 3).coerceAtLeast(0),
-                        skipped = user.skipped + 1,
-                        streak = 0
-                    )
-                    selectedChallenge = null
+                    vm.updateChallenge(openId, "skipped")
+                    val profile = (profileState as? DataState.Ready)?.data
+                    if (profile != null) {
+                        vm.updateProfile(
+                            ProfileUpdateRequest(
+                                courage = (profile.courage - 3).coerceAtLeast(0),
+                                skipped = profile.skipped + 1,
+                                streak = 0
+                            )
+                        )
+                    }
+                    selectedChallengeId = null
                 }
             )
         }
@@ -549,8 +568,14 @@ private fun OnboardingScreen(onFinish: () -> Unit) {
 }
 
 @Composable
-private fun AuthScreen(onSignIn: (String) -> Unit) {
-    var name by rememberSaveable { mutableStateOf("") }
+private fun AuthScreen(vm: SparkViewModel) {
+    var email by rememberSaveable { mutableStateOf("") }
+    var password by rememberSaveable { mutableStateOf("") }
+    var isRegisterMode by rememberSaveable { mutableStateOf(false) }
+    val authState by vm.authState.collectAsState()
+
+    // Сбрасываем ошибку при смене режима
+    LaunchedEffect(isRegisterMode) { vm.resetAuthState() }
 
     Column(
         modifier = Modifier
@@ -564,37 +589,74 @@ private fun AuthScreen(onSignIn: (String) -> Unit) {
             SparkLogo(modifier = Modifier.size(70.dp))
             Spacer(Modifier.height(22.dp))
             Text(
-                text = "Добро пожаловать в Spark",
+                text = if (isRegisterMode) "Создать аккаунт" else "Добро пожаловать",
                 style = MaterialTheme.typography.headlineMedium,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onBackground,
                 lineHeight = 34.sp
             )
             Text(
-                text = "Войди, чтобы сохранить задания, серию и шкалу смелости.",
+                text = "Задания, серия и шкала смелости сохраняются в аккаунте.",
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 lineHeight = 24.sp
             )
             OutlinedTextField(
-                value = name,
-                onValueChange = { name = it },
+                value = email,
+                onValueChange = { email = it },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
                 shape = RoundedCornerShape(18.dp),
-                label = { Text("Имя") }
+                label = { Text("Email") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email)
             )
-            SupportCard("Можно использовать любое имя. Spark не показывает профили другим людям.")
+            OutlinedTextField(
+                value = password,
+                onValueChange = { password = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                shape = RoundedCornerShape(18.dp),
+                label = { Text("Пароль") },
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password)
+            )
+            if (authState is AuthState.Error) {
+                SupportCard((authState as AuthState.Error).message)
+            }
+            SupportCard("Spark не показывает профили другим людям и не шарит данные.")
         }
 
-        Button(
-            onClick = { onSignIn(name.trim()) },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(56.dp),
-            shape = RoundedCornerShape(18.dp)
-        ) {
-            Text("Войти")
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Button(
+                onClick = {
+                    if (isRegisterMode) vm.register(email.trim(), password)
+                    else vm.login(email.trim(), password)
+                },
+                enabled = authState !is AuthState.Loading && email.isNotBlank() && password.length >= 6,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+                shape = RoundedCornerShape(18.dp)
+            ) {
+                if (authState is AuthState.Loading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(22.dp),
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Text(if (isRegisterMode) "Зарегистрироваться" else "Войти")
+                }
+            }
+            TextButton(
+                onClick = { isRegisterMode = !isRegisterMode },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    if (isRegisterMode) "Уже есть аккаунт? Войти" else "Нет аккаунта? Зарегистрироваться",
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
         }
     }
 }
@@ -603,21 +665,44 @@ private fun AuthScreen(onSignIn: (String) -> Unit) {
 private fun SparkMainContent(
     modifier: Modifier,
     screen: SparkScreen,
-    user: SparkUser,
-    challenges: List<Challenge>,
-    onOpenChallenge: (Challenge) -> Unit,
+    profileState: DataState<ProfileResponse>,
+    challengesState: DataState<List<ChallengeStateResponse>>,
+    onOpenChallenge: (Int) -> Unit,
     onNotificationsChanged: (Boolean) -> Unit,
     onLogout: () -> Unit
 ) {
-    Box(
-        modifier = modifier.fillMaxSize()
-    ) {
+    val profile = (profileState as? DataState.Ready)?.data
+    val apiStates = (challengesState as? DataState.Ready)?.data ?: emptyList()
+
+    // Мержим статичный список заданий с динамическими статусами из API
+    val challenges = initialChallenges.map { challenge ->
+        val apiState = apiStates.firstOrNull { it.challengeId == challenge.id }
+        val status = when (apiState?.status) {
+            "active" -> CompletionStatus.Active
+            "checking" -> CompletionStatus.Checking
+            "done" -> CompletionStatus.Done
+            "skipped" -> CompletionStatus.Skipped
+            else -> CompletionStatus.Open
+        }
+        challenge.copy(status = status)
+    }
+
+    Box(modifier = modifier.fillMaxSize()) {
         SparkScreenBackdrop()
         when (screen) {
-            SparkScreen.Home -> HomeScreen(Modifier.fillMaxSize(), user, challenges, onOpenChallenge)
+            SparkScreen.Home -> HomeScreen(Modifier.fillMaxSize(), profile, challenges, onOpenChallenge)
             SparkScreen.Challenges -> ChallengesScreen(Modifier.fillMaxSize(), challenges, onOpenChallenge)
-            SparkScreen.Achievements -> AchievementsScreen(Modifier.fillMaxSize(), achievementsFor(user, challenges))
-            SparkScreen.Profile -> ProfileScreen(Modifier.fillMaxSize(), user, challenges, onNotificationsChanged, onLogout)
+            SparkScreen.Achievements -> AchievementsScreen(
+                Modifier.fillMaxSize(),
+                achievementsFor(profile, challenges)
+            )
+            SparkScreen.Profile -> ProfileScreen(
+                Modifier.fillMaxSize(),
+                profile,
+                challenges,
+                onNotificationsChanged,
+                onLogout
+            )
         }
     }
 }
@@ -675,9 +760,9 @@ private fun SparkScreenBackdrop() {
 @Composable
 private fun HomeScreen(
     modifier: Modifier,
-    user: SparkUser,
+    profile: ProfileResponse?,
     challenges: List<Challenge>,
-    onOpenChallenge: (Challenge) -> Unit
+    onOpenChallenge: (Int) -> Unit
 ) {
     val daily = challenges.take(3)
     val activeChallenge = challenges.firstOrNull { it.status.isLockedInProgress() }
@@ -688,19 +773,19 @@ private fun HomeScreen(
             .padding(horizontal = 20.dp, vertical = 18.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp)
     ) {
-        GreetingHeader(user)
-        CourageCard(user)
-        StreakCard(user)
+        GreetingHeader(profile)
+        CourageCard(profile)
+        StreakCard(profile)
 
         activeChallenge?.let { challenge ->
             SectionTitle("Текущее задание", "Сначала заверши его или спокойно откажись")
-            ChallengeCard(challenge = challenge, compact = false, onClick = { onOpenChallenge(challenge) })
+            ChallengeCard(challenge = challenge, compact = false, onClick = { onOpenChallenge(challenge.id) })
         }
 
         SectionTitle("Задания дня", "Выбери комфортный шаг")
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             daily.forEach { challenge ->
-                ChallengeCard(challenge = challenge, compact = false, onClick = { onOpenChallenge(challenge) })
+                ChallengeCard(challenge = challenge, compact = false, onClick = { onOpenChallenge(challenge.id) })
             }
         }
 
@@ -720,7 +805,7 @@ private fun HomeScreen(
 private fun ChallengesScreen(
     modifier: Modifier,
     challenges: List<Challenge>,
-    onOpenChallenge: (Challenge) -> Unit
+    onOpenChallenge: (Int) -> Unit
 ) {
     var selectedCategory by rememberSaveable { mutableStateOf<ChallengeCategory?>(null) }
     val filtered = selectedCategory?.let { category ->
@@ -759,7 +844,7 @@ private fun ChallengesScreen(
             }
         }
         filtered.forEach { challenge ->
-            ChallengeCard(challenge = challenge, compact = false, onClick = { onOpenChallenge(challenge) })
+            ChallengeCard(challenge = challenge, compact = false, onClick = { onOpenChallenge(challenge.id) })
         }
     }
 }
@@ -792,7 +877,7 @@ private fun AchievementsScreen(
 @Composable
 private fun ProfileScreen(
     modifier: Modifier,
-    user: SparkUser,
+    profile: ProfileResponse?,
     challenges: List<Challenge>,
     onNotificationsChanged: (Boolean) -> Unit,
     onLogout: () -> Unit
@@ -800,6 +885,7 @@ private fun ProfileScreen(
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         onNotificationsChanged(granted)
     }
+    val photoDone = challenges.count { it.type == ChallengeType.Photo && it.status == CompletionStatus.Done }
 
     Column(
         modifier = modifier
@@ -811,8 +897,8 @@ private fun ProfileScreen(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(
                 modifier = Modifier
-                .size(72.dp)
-                .clip(CircleShape)
+                    .size(72.dp)
+                    .clip(CircleShape)
                     .background(
                         Brush.linearGradient(
                             listOf(
@@ -823,24 +909,31 @@ private fun ProfileScreen(
                     ),
                 contentAlignment = Alignment.Center
             ) {
-                Text("S", fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                val initial = profile?.email?.firstOrNull()?.uppercaseChar()?.toString() ?: "S"
+                Text(initial, fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Color.White)
             }
             Spacer(Modifier.width(14.dp))
             Column {
-                Text(user.name, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-                Text(user.level, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    profile?.email ?: "—",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(profile?.level ?: "Новичок", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
 
-        CourageCard(user)
+        CourageCard(profile)
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            StatCard("Выполнено", user.completed.toString(), Modifier.weight(1f))
-            StatCard("Серия", "${user.streak} дн.", Modifier.weight(1f))
+            StatCard("Выполнено", (profile?.completed ?: 0).toString(), Modifier.weight(1f))
+            StatCard("Серия", "${profile?.streak ?: 0} дн.", Modifier.weight(1f))
         }
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            StatCard("Смелость", user.courage.toString(), Modifier.weight(1f))
-            StatCard("Фото", challenges.count { it.selectedPhoto != null }.toString(), Modifier.weight(1f))
+            StatCard("Смелость", (profile?.courage ?: 0).toString(), Modifier.weight(1f))
+            StatCard("Фото", photoDone.toString(), Modifier.weight(1f))
         }
 
         SupportCard("Ничего страшного, если день выпал. Возвращение к себе — уже действие.")
@@ -864,7 +957,7 @@ private fun ProfileScreen(
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
-                        text = if (user.notificationsEnabled) {
+                        text = if (profile?.notificationsEnabled == true) {
                             "Сегодня отличный день для маленькой смелости"
                         } else {
                             "Новые задания, поддержка и streak reminder"
@@ -884,7 +977,7 @@ private fun ProfileScreen(
                     shape = RoundedCornerShape(16.dp),
                     contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)
                 ) {
-                    Text(if (user.notificationsEnabled) "Вкл" else "Включить")
+                    Text(if (profile?.notificationsEnabled == true) "Вкл" else "Включить")
                 }
             }
         }
@@ -908,19 +1001,21 @@ private fun ProfileScreen(
 @Composable
 private fun ChallengeSheet(
     challenge: Challenge,
+    status: String,          // "open" | "active" | "checking" | "done" | "skipped"
+    photoUrl: String?,
     activeChallenge: Challenge?,
     onDismiss: () -> Unit,
     onStart: () -> Unit,
-    onOpenActive: () -> Unit,
+    onOpenActive: (Int?) -> Unit,
     onComplete: (Uri?) -> Unit,
     onPhotoVerified: (Uri?) -> Unit,
     onSkip: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    var photoUri by remember(challenge.id, challenge.selectedPhoto) { mutableStateOf(challenge.selectedPhoto) }
-    var checking by remember(challenge.id, challenge.status) { mutableStateOf(challenge.status == CompletionStatus.Checking) }
-    val isCurrentChallenge = challenge.status == CompletionStatus.Active || challenge.status == CompletionStatus.Checking
-    val isFinished = challenge.status == CompletionStatus.Done || challenge.status == CompletionStatus.Skipped
+    var photoUri by remember(challenge.id, photoUrl) { mutableStateOf<Uri?>(photoUrl?.let { Uri.parse(it) }) }
+    var checking by remember(challenge.id, status) { mutableStateOf(status == "checking") }
+    val isCurrentChallenge = status == "active" || status == "checking"
+    val isFinished = status == "done" || status == "skipped"
     val anotherChallengeActive = activeChallenge != null && activeChallenge.id != challenge.id
     val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         photoUri = uri
@@ -993,7 +1088,7 @@ private fun ChallengeSheet(
             when {
                 anotherChallengeActive -> {
                     Button(
-                        onClick = onOpenActive,
+                        onClick = { onOpenActive(activeChallenge?.id) },
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(56.dp),
@@ -1060,7 +1155,9 @@ private fun ChallengeSheet(
 }
 
 @Composable
-private fun GreetingHeader(user: SparkUser) {
+private fun GreetingHeader(profile: ProfileResponse?) {
+    // Показываем часть email до @, либо fallback
+    val displayName = profile?.email?.substringBefore("@") ?: "…"
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -1068,7 +1165,7 @@ private fun GreetingHeader(user: SparkUser) {
     ) {
         Column {
             Text(
-                text = "Привет, ${user.name}",
+                text = "Привет, $displayName",
                 style = MaterialTheme.typography.headlineMedium,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onBackground
@@ -1084,8 +1181,10 @@ private fun GreetingHeader(user: SparkUser) {
 }
 
 @Composable
-private fun CourageCard(user: SparkUser) {
-    val target = (user.courage / 100f).coerceIn(0f, 1f)
+private fun CourageCard(profile: ProfileResponse?) {
+    val courage = profile?.courage ?: 0
+    val level = profile?.level ?: "Новичок"
+    val target = (courage / 100f).coerceIn(0f, 1f)
     val animated by animateFloatAsState(
         targetValue = target,
         animationSpec = tween(durationMillis = 900),
@@ -1100,14 +1199,14 @@ private fun CourageCard(user: SparkUser) {
             Column {
                 Text("Шкала смелости", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(
-                    text = "${user.courage}/100",
+                    text = "$courage/100",
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onSurface
                 )
             }
             Text(
-                text = user.level,
+                text = level,
                 modifier = Modifier
                     .clip(RoundedCornerShape(50))
                     .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.16f))
@@ -1208,7 +1307,8 @@ private fun CourageFlightProgress(progress: Float) {
 }
 
 @Composable
-private fun StreakCard(user: SparkUser) {
+private fun StreakCard(profile: ProfileResponse?) {
+    val streak = profile?.streak ?: 0
     SparkCard {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -1218,13 +1318,13 @@ private fun StreakCard(user: SparkUser) {
             Column(modifier = Modifier.weight(1f)) {
                 Text("Серия", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(
-                    text = "${user.streak} дня подряд",
+                    text = "$streak дня подряд",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onSurface
                 )
                 Text(
-                    text = "До бонуса +25 осталось ${(7 - user.streak).coerceAtLeast(0)} дня",
+                    text = "До бонуса +25 осталось ${(7 - streak).coerceAtLeast(0)} дня",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1236,7 +1336,7 @@ private fun StreakCard(user: SparkUser) {
                             .size(18.dp)
                             .clip(CircleShape)
                             .background(
-                                if (index < user.streak) {
+                                if (index < streak) {
                                     MaterialTheme.colorScheme.secondary
                                 } else {
                                     MaterialTheme.colorScheme.outline.copy(alpha = 0.35f)
@@ -1726,19 +1826,6 @@ private fun CompletionStatus.isLockedInProgress(): Boolean {
     return this == CompletionStatus.Active || this == CompletionStatus.Checking
 }
 
-private fun SparkUser.afterCompleted(difficulty: Difficulty): SparkUser {
-    val nextCompleted = completed + 1
-    val nextStreak = streak + 1
-    val streakBonus = if (nextStreak > 0 && nextStreak % 7 == 0) 25 else 0
-    val nextCourage = (courage + difficulty.couragePoints + streakBonus).coerceAtMost(100)
-    return copy(
-        courage = nextCourage,
-        completed = nextCompleted,
-        streak = nextStreak,
-        level = levelFor(nextCourage)
-    )
-}
-
 private fun levelFor(courage: Int): String {
     return when {
         courage >= 90 -> "Spark Master"
@@ -1749,7 +1836,9 @@ private fun levelFor(courage: Int): String {
     }
 }
 
-private fun achievementsFor(user: SparkUser, challenges: List<Challenge>): List<Achievement> {
+private fun achievementsFor(profile: ProfileResponse?, challenges: List<Challenge>): List<Achievement> {
+    val completed = profile?.completed ?: 0
+    val streak = profile?.streak ?: 0
     val socialDone = challenges.count {
         it.category == ChallengeCategory.Social && it.status == CompletionStatus.Done
     }
@@ -1760,25 +1849,25 @@ private fun achievementsFor(user: SparkUser, challenges: List<Challenge>): List<
         Achievement(
             title = "Первый шаг",
             description = "Первое выполненное задание",
-            progress = user.completed.coerceAtMost(1),
+            progress = completed.coerceAtMost(1),
             goal = 1,
-            unlocked = user.completed >= 1,
+            unlocked = completed >= 1,
             accent = SparkCoral
         ),
         Achievement(
             title = "7 дней рядом с собой",
             description = "Серия без пропусков",
-            progress = user.streak.coerceAtMost(7),
+            progress = streak.coerceAtMost(7),
             goal = 7,
-            unlocked = user.streak >= 7,
+            unlocked = streak >= 7,
             accent = SparkGold
         ),
         Achievement(
             title = "50 маленьких смелостей",
             description = "Выполненные задания за все время",
-            progress = user.completed.coerceAtMost(50),
+            progress = completed.coerceAtMost(50),
             goal = 50,
-            unlocked = user.completed >= 50,
+            unlocked = completed >= 50,
             accent = SparkClay
         ),
         Achievement(
@@ -1806,7 +1895,7 @@ private fun SparkPreview() {
     SparkTheme {
         HomeScreen(
             modifier = Modifier,
-            user = SparkUser(),
+            profile = null,
             challenges = initialChallenges,
             onOpenChallenge = {}
         )
